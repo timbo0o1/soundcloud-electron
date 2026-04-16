@@ -2,6 +2,7 @@ let view;
 
 const { app, BrowserWindow, BrowserView, Menu, Tray, session, ipcMain, globalShortcut, dialog, shell } = require('electron');
 const path = require('path');
+const fs = require('fs');
 const { ElectronBlocker } = require('@cliqz/adblocker-electron');
 const fetch = require('cross-fetch');
 const Store = require('electron-store');
@@ -809,6 +810,160 @@ async function toggleAutoLaunch() {
   } catch (err) { }
 }
 
+function mapSameSite(sameSite) {
+  const value = String(sameSite || '').toLowerCase();
+  if (value === 'strict') return 'strict';
+  if (value === 'lax') return 'lax';
+  if (value === 'none' || value === 'no_restriction') return 'no_restriction';
+  return undefined;
+}
+
+function cookieUrlFromRaw(rawCookie) {
+  if (rawCookie.url) return String(rawCookie.url);
+  const domain = String(rawCookie.domain || '').replace(/^\./, '');
+  if (!domain) return null;
+  const pathName = rawCookie.path ? String(rawCookie.path) : '/';
+  const secure = !!rawCookie.secure;
+  return `${secure ? 'https' : 'http'}://${domain}${pathName.startsWith('/') ? pathName : `/${pathName}`}`;
+}
+
+function toElectronCookie(rawCookie) {
+  if (!rawCookie || !rawCookie.name) return null;
+  const url = cookieUrlFromRaw(rawCookie);
+  if (!url) return null;
+
+  const cookie = {
+    url,
+    name: String(rawCookie.name),
+    value: rawCookie.value == null ? '' : String(rawCookie.value),
+    path: rawCookie.path ? String(rawCookie.path) : '/',
+    secure: !!rawCookie.secure,
+    httpOnly: !!rawCookie.httpOnly
+  };
+
+  if (rawCookie.domain) cookie.domain = String(rawCookie.domain);
+  const mappedSameSite = mapSameSite(rawCookie.sameSite);
+  if (mappedSameSite) cookie.sameSite = mappedSameSite;
+
+  const exp = Number(rawCookie.expirationDate || rawCookie.expires || rawCookie.expiry);
+  if (Number.isFinite(exp) && exp > 0) cookie.expirationDate = exp;
+
+  return cookie;
+}
+
+function parseJsonCookies(rawContent) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch (err) {
+    return [];
+  }
+
+  const cookies = Array.isArray(parsed)
+    ? parsed
+    : (parsed && Array.isArray(parsed.cookies) ? parsed.cookies : []);
+
+  return cookies.map(toElectronCookie).filter(Boolean);
+}
+
+function parseNetscapeCookies(rawContent) {
+  const cookies = [];
+  const lines = rawContent.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const parts = trimmed.split('\t');
+    if (parts.length < 7) continue;
+
+    const domain = parts[0];
+    const pathName = parts[2] || '/';
+    const secure = String(parts[3]).toUpperCase() === 'TRUE';
+    const expires = Number(parts[4]);
+    const name = parts[5];
+    const value = parts[6];
+    const cleanDomain = String(domain || '').replace(/^\./, '');
+    if (!name || !cleanDomain) continue;
+
+    const cookie = {
+      url: `${secure ? 'https' : 'http'}://${cleanDomain}${pathName}`,
+      name,
+      value,
+      domain,
+      path: pathName,
+      secure,
+      httpOnly: false
+    };
+
+    if (Number.isFinite(expires) && expires > 0) cookie.expirationDate = expires;
+    cookies.push(cookie);
+  }
+
+  return cookies;
+}
+
+async function importExternalBrowserSession() {
+  const picker = await dialog.showOpenDialog({
+    title: 'Import Browser Cookies/Session',
+    properties: ['openFile'],
+    filters: [
+      { name: 'Cookie files', extensions: ['json', 'txt', 'cookies'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  });
+
+  if (picker.canceled || !picker.filePaths || picker.filePaths.length === 0) return;
+
+  let rawContent;
+  try {
+    rawContent = fs.readFileSync(picker.filePaths[0], 'utf8');
+  } catch (err) {
+    dialog.showErrorBox('Import failed', 'Could not read the selected cookie file.');
+    return;
+  }
+
+  let cookies = parseJsonCookies(rawContent);
+  if (cookies.length === 0) cookies = parseNetscapeCookies(rawContent);
+  if (cookies.length === 0) {
+    dialog.showErrorBox('Import failed', 'No valid cookies found in file.');
+    return;
+  }
+
+  const soundcloudCookies = cookies.filter((cookie) => {
+    const domain = String(cookie.domain || '');
+    const url = String(cookie.url || '');
+    return domain.includes('soundcloud.com') || url.includes('soundcloud.com');
+  });
+
+  const selectedCookies = soundcloudCookies.length > 0 ? soundcloudCookies : cookies;
+  const ses = view && !view.webContents.isDestroyed() ? view.webContents.session : session.defaultSession;
+
+  let imported = 0;
+  for (const cookie of selectedCookies) {
+    try {
+      await ses.cookies.set(cookie);
+      imported += 1;
+    } catch (err) {
+      // Continue importing remaining cookies.
+    }
+  }
+
+  await ses.closeAllConnections();
+  if (view && !view.webContents.isDestroyed()) {
+    view.webContents.loadURL('https://soundcloud.com/you');
+  }
+
+  dialog.showMessageBox({
+    type: imported > 0 ? 'info' : 'warning',
+    title: imported > 0 ? 'Import complete' : 'Import incomplete',
+    message: imported > 0
+      ? `Imported ${imported} cookie(s) into Electron session.`
+      : 'No cookies could be imported from this file.',
+    buttons: ['OK']
+  });
+}
+
 function createTray(window) {
   if (!tray) {
     const iconPath = path.join(__dirname, './assets/icon.ico');
@@ -843,6 +998,12 @@ function createTray(window) {
       type: 'checkbox',
       checked: store.get('autoLaunch'),
       click: toggleAutoLaunch
+    },
+    {
+      label: 'Import Browser Cookies/Session...',
+      click: () => {
+        void importExternalBrowserSession();
+      }
     },
     {
       label: 'Check for Updates...',
